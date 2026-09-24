@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.log
+*.pid
+.DS_Store
+
+# Local development and generated artifacts
+analysis/
+demo_video/
+dist/
+tmp/
+PatchPilot_AI_Management_Demo/
+PatchPilot_AI_Management_Demo.pptx
+PatchPilot_AI_Management_Demo.pptx.inspect.ndjson
+known_hosts_*
+
+# Runtime data and local secrets
+.env
+*.env.local
+state/
+reports/
+backups/
+*.key
+*.pem
+id_*
