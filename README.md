@@ -109,6 +109,14 @@ http://<patchpilot-host-or-ip>:4128/
 
 Jobs for different SSH hosts may run concurrently. PatchPilot serializes mutating jobs for the same host to reduce Oracle inventory lock risk. Cluster operators must still follow the patch README and coordinate AdminServer, managed-server, shared-domain, and once-per-domain actions.
 
+## Optional Inactive Patch Cleanup
+
+The Inactive Patches step is optional. Operators may review and remove inactive patches, or skip the step and continue with that decision recorded in the final report. Keeping inactive patches can increase SPBAT runtime.
+
+The OPatch review and cleanup commands run as background jobs with elapsed-time and inferred-stage reporting. OPatch does not expose a reliable completion percentage or ETA for these utilities. When an operation takes longer, PatchPilot reports likely causes such as Java and inventory initialization, another OPatch inventory lock, a large inventory, slow disk or NFS storage, resource pressure, or SSH latency.
+
+The screen provides **Stop OPatch Operation** and **Stop and Skip Step** actions. Cancellation is scoped to the selected `ORACLE_HOME` and only targets `listorderedinactivepatches`, `deleteinactivepatches`, or `cleanup` utility processes and their descendants. Review the OPatch inventory before retrying a stopped delete or cleanup operation.
+
 ## Security
 
 - Do not commit passwords, private keys, customer logs, reports, or host-specific files.

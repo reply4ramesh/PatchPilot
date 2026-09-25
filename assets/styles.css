@@ -1853,6 +1853,11 @@ p {
   background: var(--danger-soft);
 }
 
+.runtime-panel.is-cancelled {
+  border-color: rgba(141, 101, 18, 0.42);
+  background: var(--amber-soft);
+}
+
 .runtime-panel-header {
   display: flex;
   flex-wrap: wrap;

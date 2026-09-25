@@ -9,6 +9,7 @@ import re
 import select
 import shlex
 import shutil
+import signal
 import socketserver
 import subprocess
 import threading
@@ -54,6 +55,10 @@ ACTIVE_TARGET_JOBS = {}
 ACTIVE_TARGET_JOB_LOCK = threading.Lock()
 MAX_JOB_OUTPUT = 512 * 1024
 DEFAULT_OPATCH_HEAP_OPTIONS = "-Xmx3072m"
+
+
+class JobCancelledError(RuntimeError):
+    pass
 
 
 def ssh_timeout(seconds):
@@ -1514,7 +1519,9 @@ def parse_inactive_output(output):
     }
 
 
+emit("Checking for another OPatch inactive-patch utility before starting the review.")
 wait_for_opatch_utilities_to_clear("inactive patch review", timeout_seconds=int(request.get("opatchWaitTimeoutSeconds") or 900))
+emit("Starting OPatch listorderedinactivepatches. OPatch is loading its Java runtime and Oracle inventory; large or locked inventories can take several minutes.")
 payload = parse_inactive_output(run_command([opatch, "util", "listorderedinactivepatches", "-oh", oracle_home]))
 print("__PATCHSCOPE_JSON_START__")
 print(json.dumps(payload))
@@ -1525,6 +1532,104 @@ print("__PATCHSCOPE_JSON_END__")
         .replace("__PATCHSCOPE_SPB_INACTIVE_JSON__", json.dumps(json.dumps(payload)))
         .replace("__PATCHSCOPE_OPATCH_HEAP_HELPER__", REMOTE_OPATCH_HEAP_HELPER)
     )
+
+
+def build_spb_inactive_cancel_script(body):
+    oracle_home = str(body.get("oracleHome") or "").strip()
+    if not oracle_home:
+        raise ValueError("ORACLE_HOME is required to stop an inactive-patch operation.")
+    payload = {"oracleHome": oracle_home}
+    script = r'''
+import json
+import os
+import re
+import signal
+import subprocess
+import time
+
+request = json.loads(__PATCHSCOPE_SPB_INACTIVE_CANCEL_JSON__)
+requested_home = str(request.get("oracleHome") or "").rstrip("/")
+oracle_home = os.path.realpath(requested_home)
+if not oracle_home or oracle_home == "/":
+    raise RuntimeError("A specific ORACLE_HOME is required for cancellation.")
+
+try:
+    raw = subprocess.check_output(["ps", "-eo", "pid=,ppid=,args="], stderr=subprocess.STDOUT)
+except Exception as error:
+    raise RuntimeError("Could not inspect remote OPatch processes: %s" % error)
+
+text = raw.decode("utf-8", "replace") if hasattr(raw, "decode") else str(raw or "")
+processes = {}
+matches = set()
+home_tokens = set([requested_home.lower(), oracle_home.lower()])
+own_pids = set([os.getpid(), os.getppid()])
+for line in text.splitlines():
+    parts = line.strip().split(None, 2)
+    if len(parts) != 3:
+        continue
+    try:
+        pid = int(parts[0])
+        ppid = int(parts[1])
+    except Exception:
+        continue
+    command = parts[2]
+    processes[pid] = {"ppid": ppid, "command": command}
+    lower = command.lower()
+    if pid in own_pids or not any(token and token in lower for token in home_tokens):
+        continue
+    if re.search(r"\butil\s+(listorderedinactivepatches|deleteinactivepatches|cleanup)\b", lower) and ("/opatch" in lower or "oracle/opatch" in lower):
+        matches.add(pid)
+
+changed = True
+while changed:
+    changed = False
+    for pid, item in processes.items():
+        if pid not in matches and item["ppid"] in matches:
+            matches.add(pid)
+            changed = True
+
+terminated = []
+for pid in sorted(matches, reverse=True):
+    try:
+        os.kill(pid, signal.SIGTERM)
+        terminated.append(pid)
+    except OSError:
+        pass
+
+deadline = time.time() + 5
+while time.time() < deadline:
+    alive = []
+    for pid in terminated:
+        try:
+            os.kill(pid, 0)
+            alive.append(pid)
+        except OSError:
+            pass
+    if not alive:
+        break
+    time.sleep(0.5)
+
+killed = []
+for pid in (alive if 'alive' in locals() else []):
+    try:
+        os.kill(pid, signal.SIGKILL)
+        killed.append(pid)
+    except OSError:
+        pass
+
+result = {
+    "status": "cancelled",
+    "oracleHome": oracle_home,
+    "matchedPids": sorted(matches),
+    "terminatedPids": terminated,
+    "killedPids": killed,
+    "message": "No matching OPatch inactive-patch utility was still running." if not matches else "Stop signal sent only to matching inactive-patch OPatch utility processes.",
+}
+print("__PATCHSCOPE_JSON_START__")
+print(json.dumps(result))
+print("__PATCHSCOPE_JSON_END__")
+'''
+    return script.replace("__PATCHSCOPE_SPB_INACTIVE_CANCEL_JSON__", json.dumps(json.dumps(payload)))
 
 
 def build_spb_inactive_delete_script(body):
@@ -5417,7 +5522,7 @@ def run_ssh(profile, script, timeout=SSH_QUICK_TIMEOUT):
     return run_local_command(command, timeout=timeout)
 
 
-def run_local_command_stream(command, timeout=SSH_QUICK_TIMEOUT, on_chunk=None, max_output=2 * 1024 * 1024):
+def run_local_command_stream(command, timeout=SSH_QUICK_TIMEOUT, on_chunk=None, max_output=2 * 1024 * 1024, cancel_event=None):
     proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     output = b""
     deadline = time.time() + timeout
@@ -5449,6 +5554,16 @@ def run_local_command_stream(command, timeout=SSH_QUICK_TIMEOUT, on_chunk=None, 
             return drained
 
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=3)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                raise JobCancelledError("Operation stopped by the user.")
             if time.time() > deadline:
                 proc.kill()
                 raise RuntimeError("SSH command timed out after %ss." % timeout)
@@ -5474,7 +5589,7 @@ def run_local_command_stream(command, timeout=SSH_QUICK_TIMEOUT, on_chunk=None, 
             proc.stdout.close()
 
 
-def run_ssh_with_password_stream(command, password, timeout=SSH_QUICK_TIMEOUT, on_chunk=None, max_output=2 * 1024 * 1024):
+def run_ssh_with_password_stream(command, password, timeout=SSH_QUICK_TIMEOUT, on_chunk=None, max_output=2 * 1024 * 1024, cancel_event=None):
     if pty is None:
         raise RuntimeError("Password SSH requires sshpass or POSIX pty support on the PatchPilot server.")
     pid, fd = pty.fork()
@@ -5520,6 +5635,14 @@ def run_ssh_with_password_stream(command, password, timeout=SSH_QUICK_TIMEOUT, o
             return drained
 
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    time.sleep(0.5)
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+                raise JobCancelledError("Operation stopped by the user.")
             if time.time() > deadline:
                 try:
                     os.kill(pid, 9)
@@ -5551,11 +5674,11 @@ def run_ssh_with_password_stream(command, password, timeout=SSH_QUICK_TIMEOUT, o
             pass
 
 
-def run_ssh_stream(profile, script, timeout=SSH_QUICK_TIMEOUT, on_chunk=None):
+def run_ssh_stream(profile, script, timeout=SSH_QUICK_TIMEOUT, on_chunk=None, cancel_event=None):
     command = build_ssh_command(profile, script)
     if profile.get("password") and not shutil.which("sshpass"):
-        return run_ssh_with_password_stream(command, profile["password"], timeout=timeout, on_chunk=on_chunk)
-    return run_local_command_stream(command, timeout=timeout, on_chunk=on_chunk)
+        return run_ssh_with_password_stream(command, profile["password"], timeout=timeout, on_chunk=on_chunk, cancel_event=cancel_event)
+    return run_local_command_stream(command, timeout=timeout, on_chunk=on_chunk, cancel_event=cancel_event)
 
 
 def parse_discovery_output(output):
@@ -5830,6 +5953,72 @@ def append_spb_inactive_job(job_id, text):
         job["output"] = visible_job_output(job["rawOutput"])[-MAX_JOB_OUTPUT:]
 
 
+def start_spb_inactive_check_job(profile, body):
+    job_id = uuid.uuid4().hex
+    oracle_home = str(body.get("oracleHome") or "").strip()
+    if not oracle_home:
+        raise ValueError("ORACLE_HOME is required for inactive patch review.")
+    target_key = acquire_target_job(profile, body, "inactive patch review", job_id)
+    cancel_event = threading.Event()
+    job = {
+        "id": job_id,
+        "kind": "check",
+        "oracleHome": oracle_home,
+        "status": "running",
+        "startedAt": time.time(),
+        "finishedAt": None,
+        "output": "",
+        "rawOutput": "",
+        "inactive": None,
+        "error": "",
+        "targetKey": target_key,
+        "cancelEvent": cancel_event,
+        "cancelRequested": False,
+    }
+    with SPB_INACTIVE_JOB_LOCK:
+        SPB_INACTIVE_JOBS[job_id] = job
+
+    def worker():
+        try:
+            append_spb_inactive_job(job_id, "Starting PatchPilot inactive patch review job.\n")
+            output = run_ssh_stream(
+                profile,
+                remote_python_command(build_spb_inactive_check_script(body)),
+                timeout=SPB_INACTIVE_CHECK_TIMEOUT + SSH_TIMEOUT_GRACE,
+                on_chunk=lambda chunk: append_spb_inactive_job(job_id, chunk),
+                cancel_event=cancel_event,
+            )
+            payload = parse_discovery_output(output)
+            with SPB_INACTIVE_JOB_LOCK:
+                current = SPB_INACTIVE_JOBS.get(job_id)
+                if current:
+                    current["status"] = "succeeded"
+                    current["inactive"] = payload
+                    current["finishedAt"] = time.time()
+                    current["output"] = visible_job_output(current.get("rawOutput", ""))[-MAX_JOB_OUTPUT:]
+        except JobCancelledError:
+            append_spb_inactive_job(job_id, "\nInactive patch review stopped by the user.\n")
+            with SPB_INACTIVE_JOB_LOCK:
+                current = SPB_INACTIVE_JOBS.get(job_id)
+                if current:
+                    current["status"] = "cancelled"
+                    current["error"] = "Inactive patch review stopped by the user."
+                    current["finishedAt"] = time.time()
+        except Exception as error:
+            append_spb_inactive_job(job_id, "\n%s\n" % str(error))
+            with SPB_INACTIVE_JOB_LOCK:
+                current = SPB_INACTIVE_JOBS.get(job_id)
+                if current:
+                    current["status"] = "failed"
+                    current["error"] = concise_error(str(error))
+                    current["finishedAt"] = time.time()
+        finally:
+            release_target_job(target_key, job_id)
+
+    threading.Thread(target=worker, daemon=True).start()
+    return job_id
+
+
 def start_spb_inactive_cleanup_job(profile, body):
     job_id = uuid.uuid4().hex
     oracle_home = str(body.get("oracleHome") or "").strip()
@@ -5837,8 +6026,10 @@ def start_spb_inactive_cleanup_job(profile, body):
         raise ValueError("ORACLE_HOME is required for inactive patch cleanup.")
     target_key = acquire_target_job(profile, body, "inactive patch cleanup", job_id)
     oracle_home_key = target_key
+    cancel_event = threading.Event()
     job = {
         "id": job_id,
+        "kind": "cleanup",
         "oracleHome": oracle_home,
         "oracleHomeKey": oracle_home_key,
         "status": "running",
@@ -5849,6 +6040,8 @@ def start_spb_inactive_cleanup_job(profile, body):
         "inactive": None,
         "error": "",
         "targetKey": target_key,
+        "cancelEvent": cancel_event,
+        "cancelRequested": False,
     }
     with SPB_INACTIVE_JOB_LOCK:
         SPB_INACTIVE_JOBS[job_id] = job
@@ -5861,6 +6054,7 @@ def start_spb_inactive_cleanup_job(profile, body):
                 remote_python_command(build_spb_inactive_delete_script(body)),
                 timeout=SPB_INACTIVE_CLEANUP_TIMEOUT + SSH_TIMEOUT_GRACE,
                 on_chunk=lambda chunk: append_spb_inactive_job(job_id, chunk),
+                cancel_event=cancel_event,
             )
             payload = parse_discovery_output(output)
             failed = payload.get("status") not in ("removed", "already-retained", "none")
@@ -5872,6 +6066,14 @@ def start_spb_inactive_cleanup_job(profile, body):
                     job["error"] = payload.get("error") or ("Inactive patch cleanup did not complete." if failed else "")
                     job["finishedAt"] = time.time()
                     job["output"] = visible_job_output(job.get("rawOutput", ""))[-MAX_JOB_OUTPUT:]
+        except JobCancelledError:
+            append_spb_inactive_job(job_id, "\nInactive patch cleanup stopped by the user. Review OPatch inventory before retrying.\n")
+            with SPB_INACTIVE_JOB_LOCK:
+                job = SPB_INACTIVE_JOBS.get(job_id)
+                if job:
+                    job["status"] = "cancelled"
+                    job["error"] = "Inactive patch cleanup stopped by the user. Review OPatch inventory before retrying."
+                    job["finishedAt"] = time.time()
         except Exception as error:
             append_spb_inactive_job(job_id, "\n%s\n" % str(error))
             with SPB_INACTIVE_JOB_LOCK:
@@ -5894,6 +6096,7 @@ def spb_inactive_job_snapshot(job_id):
             return None
         return {
             "id": job["id"],
+            "kind": job.get("kind", "cleanup"),
             "oracleHome": job.get("oracleHome", ""),
             "status": job["status"],
             "startedAt": job["startedAt"],
@@ -5901,7 +6104,45 @@ def spb_inactive_job_snapshot(job_id):
             "output": job.get("output", "")[-50000:],
             "inactive": job.get("inactive"),
             "error": job.get("error", ""),
+            "cancelRequested": bool(job.get("cancelRequested")),
         }
+
+
+def cancel_spb_inactive_job(job_id, profile, body):
+    already_finished = False
+    with SPB_INACTIVE_JOB_LOCK:
+        job = SPB_INACTIVE_JOBS.get(job_id)
+        if not job:
+            raise RuntimeError("Inactive-patch job was not found.")
+        if job.get("status") != "running":
+            already_finished = True
+        else:
+            if target_job_key(profile, body) != job.get("targetKey"):
+                raise RuntimeError("Cancellation SSH target does not match the running job.")
+            expected_home = normalize_remote_path(job.get("oracleHome") or "")
+            requested_home = normalize_remote_path(body.get("oracleHome") or "")
+            if requested_home != expected_home:
+                raise RuntimeError("Cancellation ORACLE_HOME does not match the running job.")
+            job["cancelRequested"] = True
+            cancel_event = job.get("cancelEvent")
+            if cancel_event:
+                cancel_event.set()
+    if already_finished:
+        return spb_inactive_job_snapshot(job_id), None
+    append_spb_inactive_job(job_id, "\nStop requested by the user. Closing the SSH command and targeting only inactive-patch OPatch utility processes for this ORACLE_HOME.\n")
+    cancel_result = None
+    try:
+        output = run_ssh(
+            profile,
+            remote_python_command(build_spb_inactive_cancel_script(body)),
+            timeout=ssh_timeout(45),
+        )
+        cancel_result = parse_discovery_output(output)
+        append_spb_inactive_job(job_id, "%s\n" % (cancel_result.get("message") or "Remote stop request completed."))
+    except Exception as error:
+        append_spb_inactive_job(job_id, "Remote process stop check could not be confirmed: %s\n" % concise_error(str(error)))
+        cancel_result = {"status": "warning", "error": concise_error(str(error))}
+    return spb_inactive_job_snapshot(job_id), cancel_result
 
 
 def append_oig_job(job_id, text):
@@ -6280,13 +6521,13 @@ class PatchScopeHandler(http.server.SimpleHTTPRequestHandler):
                     raise RuntimeError("SPBAT phase job was not found.")
                 send_json(self, 200, {"ok": True, "job": snapshot})
                 return
-            if self.path == "/api/spb/inactive/delete/status":
+            if self.path in ("/api/spb/inactive/status", "/api/spb/inactive/delete/status"):
                 job_id = str(body.get("jobId") or "").strip()
                 if not job_id:
-                    raise ValueError("Inactive patch cleanup job id is required.")
+                    raise ValueError("Inactive patch job id is required.")
                 snapshot = spb_inactive_job_snapshot(job_id)
                 if not snapshot:
-                    raise RuntimeError("Inactive patch cleanup job was not found.")
+                    raise RuntimeError("Inactive patch job was not found.")
                 send_json(self, 200, {"ok": True, "job": snapshot})
                 return
             if self.path == "/api/oig/script/status":
@@ -6417,6 +6658,10 @@ class PatchScopeHandler(http.server.SimpleHTTPRequestHandler):
                 payload = parse_discovery_output(output)
                 send_json(self, 200, {"ok": True, "inactive": payload})
                 return
+            if self.path == "/api/spb/inactive/check/start":
+                job_id = start_spb_inactive_check_job(profile, body)
+                send_json(self, 200, {"ok": True, "jobId": job_id})
+                return
             if self.path == "/api/spb/inactive/delete":
                 output = run_ssh(profile, remote_python_command(build_spb_inactive_delete_script(body)), timeout=SPB_INACTIVE_CLEANUP_TIMEOUT + SSH_TIMEOUT_GRACE)
                 payload = parse_discovery_output(output)
@@ -6425,6 +6670,13 @@ class PatchScopeHandler(http.server.SimpleHTTPRequestHandler):
             if self.path == "/api/spb/inactive/delete/start":
                 job_id = start_spb_inactive_cleanup_job(profile, body)
                 send_json(self, 200, {"ok": True, "jobId": job_id})
+                return
+            if self.path == "/api/spb/inactive/cancel":
+                job_id = str(body.get("jobId") or "").strip()
+                if not job_id:
+                    raise ValueError("Inactive patch job id is required.")
+                snapshot, cancellation = cancel_spb_inactive_job(job_id, profile, body)
+                send_json(self, 200, {"ok": True, "job": snapshot, "cancellation": cancellation})
                 return
             if self.path == "/api/oig/profile":
                 output = run_ssh(profile, remote_python_command(build_oig_profile_script(body)), timeout=ssh_timeout(120))

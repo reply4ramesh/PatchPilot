@@ -25,7 +25,7 @@ const spbSteps = [
   { id: "readme", label: "README", title: "Read SPB README", hint: "Load SPB README and extract SPBAT prerequisites, phases, OPatch minimums, and post steps." },
   { id: "spbBackupShutdown", label: "Stop for Backup", title: "Stop services for backup", hint: "Verify selected-home services are down before creating ORACLE_HOME, DOMAIN_HOME, and INSTANCE_HOME tar backups." },
   { id: "backup", label: "Backup", title: "Take file and database backups", hint: "Confirm ORACLE_HOME, DOMAIN_HOME, INSTANCE_HOME, and database backups before cleanup or SPBAT phases." },
-  { id: "spbInactive", label: "Inactive Patches", title: "Remove inactive patches", hint: "Review inactive patches after backups, before SPBAT setup, OPatch validation, services-up, and PreStop." },
+  { id: "spbInactive", label: "Inactive Patches", title: "Optional inactive patch review", hint: "Optionally review or remove inactive patches after backups, or skip this step with the decision recorded." },
   { id: "spbPrepare", label: "SPB Setup", title: "Prepare SPBAT run", hint: "Choose OAM/OIG/OUD/OID, create SPBAT log directory, and verify SPBAT bundle layout." },
   { id: "opatch", label: "OPatch", title: "Validate OPatch", hint: "SPB requires OPatch 13.9.4.2.17 or higher; use the OPatch bundle from the SPB download if needed." },
   { id: "spbUp", label: "Services Up", title: "Confirm services are up", hint: "For existing domains, verify services are up before PreStop. For fresh installs before domain creation, skip only the services-up check." },
@@ -74,6 +74,9 @@ const state = {
   spbInactiveJobId: "",
   spbInactiveJobOutput: "",
   spbInactiveJobStatus: "idle",
+  spbInactiveJobKind: "",
+  spbInactiveStopRequested: false,
+  spbInactiveSkipAfterCancel: false,
   spbInactiveJobStartedAt: null,
   spbInactiveJobFinishedAt: null,
   spbPrestopDone: false,
@@ -496,6 +499,9 @@ function resetSpbInactiveState() {
   state.spbInactiveJobId = "";
   state.spbInactiveJobOutput = "";
   state.spbInactiveJobStatus = "idle";
+  state.spbInactiveJobKind = "";
+  state.spbInactiveStopRequested = false;
+  state.spbInactiveSkipAfterCancel = false;
   state.spbInactiveJobStartedAt = null;
   state.spbInactiveJobFinishedAt = null;
   state.completed.delete("spbInactive");
@@ -1275,11 +1281,32 @@ function spbPhaseStageInfo(phase) {
 
 function spbInactiveStageInfo() {
   const output = String(state.spbInactiveJobOutput || "");
+  if (state.spbInactiveJobStatus === "cancelled") return { label: "Stopped by user", percent: 100 };
+  if (state.spbInactiveJobKind === "check") {
+    if (/Waiting for another OPatch/i.test(output)) return { label: "Waiting for another OPatch process", percent: 18 };
+    if (/listorderedinactivepatches|Loading the Java runtime|Oracle inventory/i.test(output)) return { label: "Reading Oracle inventory", percent: 35 };
+    return { label: "Starting inactive patch review", percent: 8 };
+  }
   if (/OPatch cleanup completed/i.test(output)) return { label: "OPatch cleanup completed", percent: 100 };
   if (/Starting OPatch cleanup|util cleanup|cleanup prompts/i.test(output)) return { label: "Running OPatch cleanup", percent: 72 };
   if (/deleteinactivepatches|Inactive Patches Cleanup option/i.test(output)) return { label: "Deleting inactive patches", percent: 36 };
   if (/RETAIN_INACTIVE_PATCHES|retain property/i.test(output)) return { label: "Setting retain property", percent: 12 };
   return { label: "Starting inactive patch cleanup", percent: 8 };
+}
+
+function spbInactiveDelayExplanation() {
+  const output = String(state.spbInactiveJobOutput || "");
+  const elapsed = Math.max(0, nowSeconds() - (normalizeTimestamp(state.spbInactiveJobStartedAt) || nowSeconds()));
+  if (/Waiting for another OPatch/i.test(output)) {
+    return "Another OPatch inactive-patch utility is using this ORACLE_HOME. PatchPilot is waiting to avoid an Oracle inventory lock conflict.";
+  }
+  if (elapsed < 30) {
+    return "OPatch is starting its Java runtime and loading the Oracle inventory. It may not print output during this startup period.";
+  }
+  if (state.spbInactiveJobKind === "cleanup") {
+    return "OPatch is updating inventory metadata and removing inactive patch files. A large inventory, slow disk or NFS storage, high CPU or memory use, or an existing inventory lock can extend this stage.";
+  }
+  return "OPatch is still reading the Oracle inventory. Common causes are a large patch inventory, a slow disk or NFS mount, high CPU or memory use, an inventory lock held by another OPatch session, or SSH latency. OPatch does not provide an exact percentage or ETA for this command.";
 }
 
 function renderRuntimeProgressPanel({ title, status, startedAt, finishedAt, estimate, stage }) {
@@ -1295,6 +1322,8 @@ function renderRuntimeProgressPanel({ title, status, startedAt, finishedAt, esti
       ? `Completed in ${formatDuration(elapsed)}`
       : effectiveStatus === "failed"
         ? `Failed after ${formatDuration(elapsed)}`
+        : effectiveStatus === "cancelled"
+          ? `Stopped after ${formatDuration(elapsed)}`
         : `${effectiveStatus} after ${formatDuration(elapsed)}`;
   const progressLabel = effectiveStatus === "running" ? "Remaining" : "Outcome";
   const progressValue = effectiveStatus === "running"
@@ -1303,6 +1332,8 @@ function renderRuntimeProgressPanel({ title, status, startedAt, finishedAt, esti
       ? "Completed successfully"
       : effectiveStatus === "failed"
         ? "Review required"
+        : effectiveStatus === "cancelled"
+          ? "Stopped by user"
         : runtimeRemainingLabel(effectiveStatus, started || nowSeconds(), finished, estimate);
   return `
     <div class="runtime-panel is-${escapeHtml(effectiveStatus)}">
@@ -1338,7 +1369,7 @@ function renderSpbPhaseRuntimePanel(phase) {
 
 function renderSpbInactiveRuntimePanel() {
   return renderRuntimeProgressPanel({
-    title: "Inactive patch cleanup runtime",
+    title: state.spbInactiveJobKind === "check" ? "Inactive patch review runtime" : "Inactive patch cleanup runtime",
     status: state.spbInactiveJobStatus,
     startedAt: state.spbInactiveJobStartedAt,
     finishedAt: state.spbInactiveJobFinishedAt,
@@ -2804,7 +2835,9 @@ function renderSpbInactiveStep() {
             ? deletionCandidate ? "is-warning" : "is-good"
             : "is-info";
   const statusTitle = jobRunning
-    ? "Inactive cleanup running"
+    ? state.spbInactiveStopRequested
+      ? "Stopping OPatch operation"
+      : state.spbInactiveJobKind === "check" ? "Inactive patch review running" : "Inactive cleanup running"
     : cleanupIssue
     ? "Inactive cleanup did not complete"
     : state.spbInactiveError
@@ -2823,7 +2856,11 @@ function renderSpbInactiveStep() {
               ? deletionCandidate ? "Inactive patches found" : "Inactive patch review complete"
               : "Check inactive patches before PreStop";
   const statusCopy = jobRunning
-    ? "PatchPilot is answering the OPatch deleteinactivepatches and cleanup prompts with y from the approved confirmation, and streaming the OPatch output below."
+    ? state.spbInactiveStopRequested
+      ? "PatchPilot sent a stop request for the selected ORACLE_HOME and is waiting for the background job to close."
+      : state.spbInactiveJobKind === "check"
+        ? "PatchPilot is running listorderedinactivepatches for the selected ORACLE_HOME and streaming available output below."
+        : "PatchPilot is answering the OPatch deleteinactivepatches and cleanup prompts with y from the approved confirmation, and streaming the OPatch output below."
     : cleanupIssue
     ? `${result.error || "OPatch inactive cleanup did not reach the requested retain level."} Continue is blocked until cleanup succeeds, or the customer explicitly accepts keeping inactive patches for this run.`
     : state.spbInactiveError
@@ -2854,15 +2891,30 @@ function renderSpbInactiveStep() {
       <code>${escapeHtml(spbInactiveDeleteCommand())}</code>
       <code>${escapeHtml(spbInactiveCleanupCommand())}</code>
     </div>
-    <div class="review-box is-warning">
-      <strong>Check this before SPBAT PreStop</strong>
-      <p>Inactive patches can make SPBAT PreStop run longer. PatchPilot runs this after services are stopped for backup and backups are confirmed, before SPBAT setup and formal OPatch validation. The OPatch utility command is checked during this step.</p>
+    <div class="review-box is-info">
+      <strong>Optional step</strong>
+      <p>You may review and remove inactive patches before SPBAT PreStop, or skip this step and continue. Keeping inactive patches can make SPBAT take longer; PatchPilot records that decision in the final report.</p>
+      ${!jobRunning && !state.spbInactiveSkipConfirmed ? `
+        <div class="inline-actions">
+          <button id="spbInactiveSkipOptionalButton" class="button button-secondary" type="button">Skip This Optional Step</button>
+        </div>
+      ` : ""}
     </div>
     <div class="review-box ${statusClass}">
       <strong>${escapeHtml(statusTitle)}</strong>
       <p>${escapeHtml(statusCopy)}</p>
     </div>
     ${renderSpbInactiveRuntimePanel()}
+    ${jobRunning ? `
+      <div class="review-box is-warning">
+        <strong>${state.spbInactiveStopRequested ? "Stop requested" : "Why this may take longer"}</strong>
+        <p>${escapeHtml(spbInactiveDelayExplanation())}</p>
+        <div class="inline-actions">
+          <button id="spbInactiveStopButton" class="button button-secondary" type="button" ${state.spbInactiveStopRequested ? "disabled" : ""}>${state.spbInactiveStopRequested ? "Stopping..." : "Stop OPatch Operation"}</button>
+          <button id="spbInactiveStopAndSkipButton" class="button button-secondary" type="button" ${state.spbInactiveStopRequested ? "disabled" : ""}>Stop and Skip Step</button>
+        </div>
+      </div>
+    ` : ""}
     ${dryRunCleanupPreview ? `
       <div class="review-box is-warning">
         <strong>Dry-run is on</strong>
@@ -2898,7 +2950,7 @@ function renderSpbInactiveStep() {
         <div><span>Services stopped before backup</span><strong>${escapeHtml(backupShutdownComplete() ? "Confirmed" : "Not confirmed")}</strong></div>
         <div><span>Backup safety</span><strong>${escapeHtml(backupComplete ? "Backup gate complete" : "Not confirmed yet")}</strong></div>
         <div><span>Downtime gate</span><strong>${escapeHtml(downtimeReady ? "Ready" : cleanupIssue ? "Blocked by cleanup failure" : deletionCandidate || retainDecisionCandidate ? "Decision required" : "Not checked")}</strong></div>
-        ${state.spbInactiveJobId ? `<div><span>Cleanup job</span><strong>${escapeHtml(state.spbInactiveJobStatus || "unknown")}</strong></div>` : ""}
+        ${state.spbInactiveJobId ? `<div><span>${state.spbInactiveJobKind === "check" ? "Review" : "Cleanup"} job</span><strong>${escapeHtml(state.spbInactiveJobStatus || "unknown")}</strong></div>` : ""}
       </div>
     ` : ""}
     ${result ? `
@@ -4472,6 +4524,14 @@ function bindStepEvents(id) {
     if (keepAndContinueButton) keepAndContinueButton.addEventListener("click", () => {
       acceptSpbInactiveKeepDecision({ advance: true });
     });
+    const skipOptionalButton = document.getElementById("spbInactiveSkipOptionalButton");
+    if (skipOptionalButton) skipOptionalButton.addEventListener("click", () => {
+      acceptSpbInactiveKeepDecision({ advance: true });
+    });
+    const stopButton = document.getElementById("spbInactiveStopButton");
+    if (stopButton) stopButton.addEventListener("click", () => stopSpbInactiveOperation(false));
+    const stopAndSkipButton = document.getElementById("spbInactiveStopAndSkipButton");
+    if (stopAndSkipButton) stopAndSkipButton.addEventListener("click", () => stopSpbInactiveOperation(true));
     const failureReportButton = document.getElementById("spbInactiveFailureReportButton");
     if (failureReportButton) failureReportButton.addEventListener("click", generateSpbInactiveFailureReport);
   }
@@ -6222,9 +6282,37 @@ async function validateOpatch() {
   render();
 }
 
+async function stopSpbInactiveOperation(skipAfterCancel) {
+  if (!state.spbInactiveJobId || state.spbInactiveJobStatus !== "running" || state.spbInactiveStopRequested) return;
+  const home = selectedHome();
+  state.spbInactiveStopRequested = true;
+  state.spbInactiveSkipAfterCancel = Boolean(skipAfterCancel);
+  setStatus("Stopping inactive patch operation", "neutral");
+  log(`Stop requested for the inactive-patch OPatch operation under ${home.oracleHome}.`, "warn");
+  render();
+  try {
+    const result = await postJson("/api/spb/inactive/cancel", {
+      ...connectionPayload(),
+      jobId: state.spbInactiveJobId,
+      oracleHome: home.oracleHome
+    });
+    const cancellation = result.cancellation || {};
+    if (cancellation.message) log(cancellation.message, cancellation.status === "warning" ? "warn" : "pass");
+    if (Array.isArray(cancellation.matchedPids) && cancellation.matchedPids.length) {
+      log(`Targeted remote OPatch process IDs: ${cancellation.matchedPids.join(", ")}.`, "warn");
+    }
+  } catch (error) {
+    state.spbInactiveStopRequested = false;
+    state.spbInactiveSkipAfterCancel = false;
+    setStatus("Stop request could not be confirmed", "danger");
+    log(error.message, "error");
+    render();
+  }
+}
+
 async function runSpbInactivePatchReview() {
   if (state.spbInactiveJobStatus === "running") {
-    log("Inactive patch cleanup is already running. Wait for the current OPatch job to finish before starting another cleanup.", "warn");
+    log("An inactive-patch OPatch operation is already running. Stop it or wait for it to finish before starting another.", "warn");
     return;
   }
   const home = selectedHome();
@@ -6276,6 +6364,9 @@ async function runSpbInactivePatchReview() {
     state.spbInactiveJobId = "";
     state.spbInactiveJobOutput = "";
     state.spbInactiveJobStatus = "running";
+    state.spbInactiveJobKind = "cleanup";
+    state.spbInactiveStopRequested = false;
+    state.spbInactiveSkipAfterCancel = false;
     state.spbInactiveJobStartedAt = nowSeconds();
     state.spbInactiveJobFinishedAt = null;
     const start = await postJson("/api/spb/inactive/delete/start", {
@@ -6294,7 +6385,7 @@ async function runSpbInactivePatchReview() {
       let finalJob = null;
       while (true) {
         await sleep(1500);
-        const snapshot = await postJson("/api/spb/inactive/delete/status", { jobId: state.spbInactiveJobId });
+        const snapshot = await postJson("/api/spb/inactive/status", { jobId: state.spbInactiveJobId });
         const job = snapshot.job || {};
         const nextOutput = job.output || "";
         const previousOutput = state.spbInactiveJobOutput || "";
@@ -6306,14 +6397,25 @@ async function runSpbInactivePatchReview() {
         }
         state.spbInactiveJobOutput = nextOutput;
         state.spbInactiveJobStatus = job.status || "running";
+        state.spbInactiveJobKind = job.kind || state.spbInactiveJobKind;
+        state.spbInactiveStopRequested = Boolean(job.cancelRequested) || state.spbInactiveStopRequested;
         state.spbInactiveJobStartedAt = normalizeTimestamp(job.startedAt) || state.spbInactiveJobStartedAt;
         state.spbInactiveJobFinishedAt = normalizeTimestamp(job.finishedAt);
         logCommandTail(delta, "Inactive patch cleanup");
         render();
-        if (job.status === "succeeded" || job.status === "failed") {
+        if (["succeeded", "failed", "cancelled"].includes(job.status)) {
           finalJob = job;
           break;
         }
+      }
+      if (finalJob && finalJob.status === "cancelled") {
+        state.spbInactiveError = "";
+        state.spbInactiveReviewed = false;
+        state.completed.delete("spbInactive");
+        state.failed.delete("spbInactive");
+        setStatus("Inactive cleanup stopped", "neutral");
+        log(finalJob.error || "Inactive patch cleanup stopped by the user. Review OPatch inventory before retrying.", "warn");
+        return;
       }
       const finalOutput = (finalJob && finalJob.output) || state.spbInactiveJobOutput || "";
       state.spbInactiveResult = finalJob && finalJob.inactive ? finalJob.inactive : {
@@ -6373,8 +6475,12 @@ async function runSpbInactivePatchReview() {
       setStatus("Inactive cleanup failed", "danger");
       log(error.message, "error");
     } finally {
+      const skipAfterCancel = state.spbInactiveJobStatus === "cancelled" && state.spbInactiveSkipAfterCancel;
+      state.spbInactiveStopRequested = false;
+      state.spbInactiveSkipAfterCancel = false;
       setBusy(false);
       render();
+      if (skipAfterCancel) acceptSpbInactiveKeepDecision({ advance: true });
     }
     return;
   }
@@ -6382,18 +6488,59 @@ async function runSpbInactivePatchReview() {
   setBusy(true, "Checking inactive patches");
   setStatus("Checking inactive patches");
   state.spbInactiveError = "";
-  state.spbInactiveJobStartedAt = null;
+  state.spbInactiveJobId = "";
+  state.spbInactiveJobOutput = "";
+  state.spbInactiveJobStatus = "running";
+  state.spbInactiveJobKind = "check";
+  state.spbInactiveStopRequested = false;
+  state.spbInactiveSkipAfterCancel = false;
+  state.spbInactiveJobStartedAt = nowSeconds();
   state.spbInactiveJobFinishedAt = null;
   log(`Checking inactive patches for ${home.oracleHome}.`);
   log(spbInactiveListCommand());
   try {
-    const result = await postJson("/api/spb/inactive/check", {
+    const start = await postJson("/api/spb/inactive/check/start", {
       ...connectionPayload(),
       oracleHome: home.oracleHome,
       retainLevel: spbInactiveRetainLevel(),
       opatchHeapOptions: opatchHeapOptions()
     });
-    state.spbInactiveCheck = result.inactive || null;
+    state.spbInactiveJobId = start.jobId || "";
+    if (!state.spbInactiveJobId) throw new Error("Inactive patch review job did not return a job id.");
+    let finalJob = null;
+    while (true) {
+      await sleep(1500);
+      const snapshot = await postJson("/api/spb/inactive/status", { jobId: state.spbInactiveJobId });
+      const job = snapshot.job || {};
+      const nextOutput = job.output || "";
+      const previousOutput = state.spbInactiveJobOutput || "";
+      const delta = nextOutput.startsWith(previousOutput) ? nextOutput.slice(previousOutput.length) : (nextOutput !== previousOutput ? nextOutput : "");
+      state.spbInactiveJobOutput = nextOutput;
+      state.spbInactiveJobStatus = job.status || "running";
+      state.spbInactiveJobKind = job.kind || "check";
+      state.spbInactiveStopRequested = Boolean(job.cancelRequested) || state.spbInactiveStopRequested;
+      state.spbInactiveJobStartedAt = normalizeTimestamp(job.startedAt) || state.spbInactiveJobStartedAt;
+      state.spbInactiveJobFinishedAt = normalizeTimestamp(job.finishedAt);
+      logCommandTail(delta, "Inactive patch check");
+      render();
+      if (["succeeded", "failed", "cancelled"].includes(job.status)) {
+        finalJob = job;
+        break;
+      }
+    }
+    if (finalJob && finalJob.status === "cancelled") {
+      state.spbInactiveError = "";
+      state.spbInactiveReviewed = false;
+      state.completed.delete("spbInactive");
+      state.failed.delete("spbInactive");
+      setStatus("Inactive review stopped", "neutral");
+      log(finalJob.error || "Inactive patch review stopped by the user.", "warn");
+      return;
+    }
+    if (!finalJob || finalJob.status !== "succeeded") {
+      throw new Error((finalJob && finalJob.error) || "Inactive patch review did not complete.");
+    }
+    state.spbInactiveCheck = finalJob.inactive || null;
     state.spbInactiveResult = null;
     if (!state.spbInactiveCheck || !state.spbInactiveCheck.hasInactive) {
       state.spbInactiveReviewed = true;
@@ -6432,8 +6579,12 @@ async function runSpbInactivePatchReview() {
     setStatus("Inactive check failed", "danger");
     log(error.message, "error");
   } finally {
+    const skipAfterCancel = state.spbInactiveJobStatus === "cancelled" && state.spbInactiveSkipAfterCancel;
+    state.spbInactiveStopRequested = false;
+    state.spbInactiveSkipAfterCancel = false;
     setBusy(false);
     render();
+    if (skipAfterCancel) acceptSpbInactiveKeepDecision({ advance: true });
   }
 }
 
