@@ -37,7 +37,7 @@ done
 
 PORT="$(grep -E '^PATCHSCOPE_PORT=' "${CONFIG_FILE}" 2>/dev/null | tail -n 1 | cut -d= -f2 || true)"
 PORT="${PORT:-4128}"
-if curl -fsS "http://127.0.0.1:${PORT}/api/update-readiness" | grep -q '"ready": false'; then
+if curl --noproxy '*' -fsS "http://127.0.0.1:${PORT}/api/update-readiness" | grep -q '"ready": false'; then
   echo "PatchPilot has active patch jobs. Upgrade cancelled." >&2
   exit 1
 fi
@@ -71,10 +71,10 @@ rm -rf "${INSTALL_DIR}"
 mv "${STAGE_DIR}" "${INSTALL_DIR}"
 systemctl start patchpilot.service
 for _ in {1..20}; do
-  curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null && break
+  curl --noproxy '*' -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null && break
   sleep 1
 done
-curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null
+curl --noproxy '*' -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null
 trap - ERR
 echo "PatchPilot upgraded from ${CURRENT_VERSION} to ${NEW_VERSION}."
 echo "Backup: ${BACKUP_DIR}"

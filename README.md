@@ -88,7 +88,7 @@ After changing `/etc/patchpilot.env`:
 sudo systemctl restart patchpilot
 ```
 
-Proxy variables such as `HTTPS_PROXY` and `NO_PROXY` may be added to `/etc/patchpilot.env` when the management host requires a proxy to reach GitHub.
+Proxy variables such as `HTTPS_PROXY` may be added to `/etc/patchpilot.env` when the management host requires a proxy to reach GitHub. Keep `NO_PROXY=localhost,127.0.0.1` and `no_proxy=localhost,127.0.0.1` so local health checks never use the corporate proxy.
 
 ## Service Commands
 
@@ -96,7 +96,7 @@ Proxy variables such as `HTTPS_PROXY` and `NO_PROXY` may be added to `/etc/patch
 sudo systemctl status patchpilot --no-pager
 sudo systemctl restart patchpilot
 sudo journalctl -u patchpilot -f
-curl -fsS http://127.0.0.1:4128/healthz
+curl --noproxy '*' -fsS http://127.0.0.1:4128/healthz
 ```
 
 Then open:

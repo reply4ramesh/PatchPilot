@@ -56,16 +56,33 @@ for required in index.html server.py patchscope.sh VERSION assets server-app/upg
 done
 
 if [[ "${SKIP_OS_PACKAGES}" != "1" ]]; then
-  if command -v dnf >/dev/null 2>&1; then
-    dnf install -y python3 openssh-clients sshpass curl tar
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y python3 openssh-clients sshpass curl tar
-  elif command -v apt-get >/dev/null 2>&1; then
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y python3 openssh-client sshpass curl tar
+  packages=()
+  command -v python3 >/dev/null 2>&1 || packages+=(python3)
+  command -v curl >/dev/null 2>&1 || packages+=(curl)
+  command -v tar >/dev/null 2>&1 || packages+=(tar)
+  command -v sshpass >/dev/null 2>&1 || packages+=(sshpass)
+  if ! command -v ssh >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+      packages+=(openssh-client)
+    else
+      packages+=(openssh-clients)
+    fi
+  fi
+
+  if (( ${#packages[@]} > 0 )); then
+    if command -v dnf >/dev/null 2>&1; then
+      dnf install -y "${packages[@]}"
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y "${packages[@]}"
+    elif command -v apt-get >/dev/null 2>&1; then
+      apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+    else
+      echo "Install these required packages and retry: ${packages[*]}" >&2
+      exit 1
+    fi
   else
-    echo "Install Python 3, OpenSSH client, curl, tar, and optionally sshpass, then rerun with --skip-os-packages." >&2
-    exit 1
+    echo "Required OS commands are already installed; skipping package-manager changes."
   fi
 fi
 
@@ -93,9 +110,13 @@ PATCHPILOT_LOG_DIR=${LOG_DIR}
 PATCHPILOT_GITHUB_OWNER=reply4ramesh
 PATCHPILOT_GITHUB_REPO=PatchPilot
 PATCHPILOT_GITHUB_BRANCH=main
+NO_PROXY=localhost,127.0.0.1
+no_proxy=localhost,127.0.0.1
 EOF
 else
   sed -i "s/^PATCHSCOPE_PORT=.*/PATCHSCOPE_PORT=${PORT}/" "${CONFIG_FILE}"
+  grep -q '^NO_PROXY=' "${CONFIG_FILE}" || printf '%s\n' 'NO_PROXY=localhost,127.0.0.1' >> "${CONFIG_FILE}"
+  grep -q '^no_proxy=' "${CONFIG_FILE}" || printf '%s\n' 'no_proxy=localhost,127.0.0.1' >> "${CONFIG_FILE}"
 fi
 
 cat > /etc/systemd/system/patchpilot.service <<EOF
@@ -155,10 +176,10 @@ else
 fi
 
 for _ in {1..20}; do
-  curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null && break
+  curl --noproxy '*' -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null && break
   sleep 1
 done
-curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null
+curl --noproxy '*' -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null
 
 HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 echo

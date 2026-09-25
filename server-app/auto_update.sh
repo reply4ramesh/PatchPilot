@@ -23,7 +23,7 @@ if [[ -z "${REMOTE_VERSION}" || "${REMOTE_VERSION}" == "${CURRENT_VERSION}" ]]; 
 fi
 
 PORT="${PATCHSCOPE_PORT:-4128}"
-if curl -fsS "http://127.0.0.1:${PORT}/api/update-readiness" | grep -q '"ready": false'; then
+if curl --noproxy '*' -fsS "http://127.0.0.1:${PORT}/api/update-readiness" | grep -q '"ready": false'; then
   echo "PatchPilot ${REMOTE_VERSION} is available, but active patch jobs prevent upgrading."
   exit 0
 fi
