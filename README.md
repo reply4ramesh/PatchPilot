@@ -18,19 +18,21 @@ PatchPilot should run on a controlled management host. It does not need to be in
 
 ## Quick Install
 
-The installer defaults to port `4128`, creates the `patchpilot` service account, installs a `systemd` service, and starts PatchPilot.
+The recommended installation defaults to port `4128`, creates the `patchpilot` service account, installs a `systemd` service, starts PatchPilot, and enables the daily GitHub update timer at 2:00 AM server local time.
 
 ```bash
-sudo bash -lc 'cd /tmp && rm -rf PatchPilot-main patchpilot-main.tar.gz && curl -L https://github.com/reply4ramesh/PatchPilot/archive/refs/heads/main.tar.gz -o patchpilot-main.tar.gz && tar -xzf patchpilot-main.tar.gz && bash /tmp/PatchPilot-main/server-app/install.sh'
+sudo bash -lc 'cd /tmp && rm -rf PatchPilot-main patchpilot-main.tar.gz && curl -L https://github.com/reply4ramesh/PatchPilot/archive/refs/heads/main.tar.gz -o patchpilot-main.tar.gz && tar -xzf patchpilot-main.tar.gz && bash /tmp/PatchPilot-main/server-app/install.sh --auto-update daily'
 ```
+
+Remove `--auto-update daily` from the command when automatic updates are not wanted. Without this parameter, the update timer remains disabled and updates can still be applied manually.
 
 To use a different port or skip OS package installation:
 
 ```bash
-sudo bash /tmp/PatchPilot-main/server-app/install.sh --port 4128 --skip-os-packages
+sudo bash /tmp/PatchPilot-main/server-app/install.sh --port 4128 --auto-update daily --skip-os-packages
 ```
 
-Enable the optional daily update timer during installation:
+To select a different local update-check hour:
 
 ```bash
 sudo bash /tmp/PatchPilot-main/server-app/install.sh --auto-update daily --auto-update-hour 2
