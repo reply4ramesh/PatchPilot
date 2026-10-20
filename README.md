@@ -126,6 +126,10 @@ The screen provides **Stop OPatch Operation** and **Stop and Skip Step** actions
 - Validate each PatchPilot release in a non-production environment before production use.
 - Do not expose the service directly to the public internet.
 
+## FMW Monitoring Dashboard Integration
+
+PatchPilot accepts a browser launch context from the FMW Monitoring Dashboard. The handoff can prefill the target host, SSH port/user, patch type, patch directory, product, and Oracle-home paths. Passwords, private keys, and passphrases are never accepted through the URL. The operator must enter the SSH password in PatchPilot, and PatchPilot still performs its normal connection, directory, discovery, and README validation before any patch action.
+
 ## Uninstall
 
 ```bash

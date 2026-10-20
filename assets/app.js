@@ -41,6 +41,7 @@ const spbSteps = [
 let discoveredHomes = [];
 
 const state = {
+  integrationContext: null,
   activeStep: 0,
   completed: new Set(),
   failed: new Set(),
@@ -1917,6 +1918,12 @@ function renderConnectStep() {
       <p class="page-breadcrumb">Server Access</p>
       <h2>SSH and Patch Source</h2>
     </div>
+    ${state.integrationContext ? `
+      <div class="review-box is-info integration-context">
+        <strong>Opened from FMW Monitoring Dashboard</strong>
+        <p>Target details were prefilled from ${escapeHtml(state.integrationContext.customer || "the selected environment")}. Enter the SSH password, then connect so PatchPilot can validate the server and patch directory independently.</p>
+      </div>
+    ` : ""}
     <div class="form-grid">
       <label class="field"><span>SSH Host or IP</span><input id="hostInput" value="${escapeHtml(state.form.host)}" placeholder="Example: appserver01.example.com or 192.0.2.10"></label>
       <label class="field"><span>SSH Port</span><input id="portInput" value="${escapeHtml(state.form.port)}"></label>
@@ -7879,12 +7886,36 @@ function bindGlobalEvents() {
 }
 
 function init() {
+  applyLaunchContext();
   const savedTheme = localStorage.getItem(STORAGE_KEYS.theme) || "redwood";
   dom.appThemeSelect.value = savedTheme;
   document.body.dataset.appTheme = savedTheme;
   bindGlobalEvents();
   log("PatchPilot guided workflow ready.");
   render();
+}
+
+function applyLaunchContext() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("source") !== "fmw-dashboard") return;
+  const allowedPatchTypes = new Set(["One-off", "PSU", "SPU", "CSPU", "BSU", "Bundle Patch", "Stack Patch Bundle"]);
+  const patchType = params.get("patchType") || "";
+  state.form.host = (params.get("host") || "").trim();
+  state.form.port = (params.get("port") || "22").trim() || "22";
+  state.form.user = (params.get("user") || "oracle").trim() || "oracle";
+  state.form.patchPath = (params.get("patchPath") || "").trim();
+  state.form.patchType = allowedPatchTypes.has(patchType) ? patchType : state.form.patchType;
+  state.form.customer = (params.get("customer") || "").trim();
+  state.form.changeRef = (params.get("changeRef") || "").trim();
+  state.selectedHomePath = homePathKey(params.get("oracleHome") || params.get("instanceHome") || "");
+  state.integrationContext = {
+    environmentId: (params.get("environmentId") || "").trim(),
+    customer: state.form.customer,
+    product: (params.get("product") || "").trim(),
+    oracleHome: (params.get("oracleHome") || "").trim(),
+    domainHome: (params.get("domainHome") || "").trim(),
+    instanceHome: (params.get("instanceHome") || "").trim()
+  };
 }
 
 init();
